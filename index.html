@@ -684,19 +684,36 @@ async function carregarArquivoPublico(){
   }catch(e){ return false; }
 }
 
-// Grava o array atual de músicas no musicas.json do repositório.
+// Busca só o sha atual do arquivo no GitHub, sem mexer nas músicas em memória.
+async function obterShaAtual(cfg){
+  try{
+    const resp = await fetch(
+      `https://api.github.com/repos/${cfg.owner}/${cfg.repo}/contents/${encodeURIComponent(cfg.path)}?ref=${encodeURIComponent(cfg.branch)}`,
+      { headers: { Authorization: `token ${cfg.token}`, Accept: 'application/vnd.github+json' } }
+    );
+    if(resp.status === 404) return null;
+    if(!resp.ok) return undefined; // erro real, diferente de "não existe"
+    const dados = await resp.json();
+    return dados.sha;
+  }catch(e){ return undefined; }
+}
+
 async function escreverNoGitHub(){
   salvarNoArmazenamento(); // localStorage como rede de segurança, sempre
   const cfg = obterConfigGH();
-  if(!cfg || !cfg.owner || !cfg.repo || !cfg.token){ atualizarStatusGitHub(); return; }
-  try{
+  if(!cfg || !cfg.owner || !cfg.repo || !cfg.token){
+    alert('Essa música ficou salva só neste navegador — a sincronização com o GitHub não está conectada aqui. Abra o ⚙ para conectar.');
+    return false;
+  }
+
+  const tentarGravar = async () => {
     const corpo = {
       message: 'Atualiza musicas.json — Músicas ECC',
       content: utf8ParaBase64(JSON.stringify(musicas, null, 2)),
       branch: cfg.branch
     };
     if(shaArquivoGH) corpo.sha = shaArquivoGH;
-    const resp = await fetch(
+    return fetch(
       `https://api.github.com/repos/${cfg.owner}/${cfg.repo}/contents/${encodeURIComponent(cfg.path)}`,
       {
         method: 'PUT',
@@ -708,15 +725,33 @@ async function escreverNoGitHub(){
         body: JSON.stringify(corpo)
       }
     );
-    if(!resp.ok) throw new Error('falha ao gravar no GitHub');
+  };
+
+  try{
+    let resp = await tentarGravar();
+
+    // sha desatualizado (arquivo mudou desde a última leitura) — busca o
+    // sha atual e tenta gravar de novo, uma única vez, sem perder a edição.
+    if(resp.status === 409){
+      shaArquivoGH = await obterShaAtual(cfg);
+      resp = await tentarGravar();
+    }
+
+    if(!resp.ok){
+      let detalhe = '';
+      try{ const corpo = await resp.json(); detalhe = corpo.message || ''; }catch(e){}
+      throw new Error(`HTTP ${resp.status}${detalhe ? ' — ' + detalhe : ''}`);
+    }
+
     const dados = await resp.json();
     shaArquivoGH = dados.content.sha;
     githubConectado = true;
+    return true;
   }catch(e){
     githubConectado = false;
-    console.error(e);
+    alert(`Salvou só neste navegador — a gravação no GitHub falhou.\nMotivo: ${e.message}\n\nAs músicas continuam aqui; tente salvar de novo, ou confira a conexão no ⚙.`);
+    return false;
   }
-  atualizarStatusGitHub();
 }
 
 // Remove aspas curvas, espaços invisíveis, quebras de linha e qualquer
