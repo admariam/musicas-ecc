@@ -376,6 +376,20 @@
       <div>
         <button type="button" class="primario" onclick="salvarConfigGithub()">Salvar e conectar</button>
       </div>
+
+      <div style="border-top:1px solid var(--linha); margin-top:8px; padding-top:18px;">
+        <label>Levar essa configuração para outro aparelho</label>
+        <div class="ajuda" style="margin-top:-4px; margin-bottom:10px;">
+          Copie o código abaixo aqui e cole no mesmo campo, no ⚙ do outro aparelho — evita
+          preencher os 4 campos de novo. Guarde esse código só em lugar seguro (gerenciador
+          de senhas, por exemplo), pois ele contém o token.
+        </div>
+        <div style="display:flex; gap:8px;">
+          <input type="text" id="gh-config-portavel" placeholder="Colar código de configuração aqui...">
+          <button type="button" onclick="copiarConfigPortavel()" style="white-space:nowrap;">Copiar meu código</button>
+          <button type="button" onclick="colarConfigPortavel()" style="white-space:nowrap;">Usar código colado</button>
+        </div>
+      </div>
     </div>
   </div>
 </div>
@@ -628,22 +642,45 @@ function base64ParaUtf8(b64){
   return decodeURIComponent(escape(atob(b64.replace(/\n/g,''))));
 }
 
+let ultimoErroGH = '';
+
 // Lê o musicas.json atual do repositório e atualiza a lista em memória.
 async function carregarDoGitHub(){
   const cfg = obterConfigGH();
-  if(!cfg || !cfg.owner || !cfg.repo || !cfg.token) return false;
+  if(!cfg || !cfg.owner || !cfg.repo || !cfg.token){ ultimoErroGH = 'Configuração incompleta.'; return false; }
   try{
     const resp = await fetch(
       `https://api.github.com/repos/${cfg.owner}/${cfg.repo}/contents/${encodeURIComponent(cfg.path)}?ref=${encodeURIComponent(cfg.branch)}`,
       { headers: { Authorization: `token ${cfg.token}`, Accept: 'application/vnd.github+json' } }
     );
     if(resp.status === 404){ shaArquivoGH = null; return true; } // arquivo ainda não existe no repo
-    if(!resp.ok) return false;
+    if(!resp.ok){
+      let detalhe = '';
+      try{ const corpo = await resp.json(); detalhe = corpo.message || ''; }catch(e){}
+      ultimoErroGH = `HTTP ${resp.status}${detalhe ? ' — ' + detalhe : ''}`;
+      return false;
+    }
     const dados = await resp.json();
     shaArquivoGH = dados.sha;
     const lista = JSON.parse(base64ParaUtf8(dados.content));
     if(Array.isArray(lista)){ musicas = lista; salvarNoArmazenamento(); }
     return true;
+  }catch(e){
+    ultimoErroGH = 'Falha de rede: ' + e.message;
+    return false;
+  }
+}
+
+// Fallback de leitura, sem token: busca o musicas.json direto do site
+// publicado (funciona em qualquer aparelho/navegador, mesmo sem configurar
+// o GitHub ali — só não permite salvar, isso ainda exige o token).
+async function carregarArquivoPublico(){
+  try{
+    const resp = await fetch('musicas.json', { cache: 'no-store' });
+    if(!resp.ok) return false;
+    const dados = await resp.json();
+    if(Array.isArray(dados)){ musicas = dados; salvarNoArmazenamento(); return true; }
+    return false;
   }catch(e){ return false; }
 }
 
@@ -682,12 +719,64 @@ async function escreverNoGitHub(){
   atualizarStatusGitHub();
 }
 
+// Remove aspas curvas, espaços invisíveis, quebras de linha e qualquer
+// caractere fora do ASCII básico — comum quando se cola texto vindo do
+// celular, WhatsApp, Notion etc., e que quebra cabeçalhos HTTP.
+function limparParaHeader(str){
+  return str
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/[\u201C\u201D]/g, '"')
+    .replace(/[\u2013\u2014]/g, '-')
+    .replace(/\s/g, '')
+    .replace(/[^\x20-\x7E]/g, '');
+}
+
+// Gera um código único (base64) com toda a config, pra levar pra outro aparelho
+// sem preencher campo por campo. O código carrega o token — tratar como senha.
+function copiarConfigPortavel(){
+  const cfg = obterConfigGH();
+  if(!cfg || !cfg.owner || !cfg.token){
+    alert('Salve e conecte a configuração aqui primeiro, antes de gerar o código.');
+    return;
+  }
+  const codigo = 'CIFRARIO1:' + utf8ParaBase64(JSON.stringify(cfg));
+  const campo = document.getElementById('gh-config-portavel');
+  campo.value = codigo;
+  campo.select();
+  try{
+    navigator.clipboard.writeText(codigo);
+    alert('Código copiado! Cole no outro aparelho, no mesmo campo, e clique em "Usar código colado".');
+  }catch(e){
+    alert('Não consegui copiar automaticamente — selecione o texto do campo e copie manualmente (Ctrl+C).');
+  }
+}
+
+async function colarConfigPortavel(){
+  const valor = document.getElementById('gh-config-portavel').value.trim();
+  if(!valor.startsWith('CIFRARIO1:')){
+    alert('Esse não parece um código de configuração válido.');
+    return;
+  }
+  try{
+    const cfg = JSON.parse(base64ParaUtf8(valor.slice('CIFRARIO1:'.length)));
+    salvarConfigGHNoStorage(cfg);
+    preencherFormConfigGH();
+    const ok = await carregarDoGitHub();
+    githubConectado = ok;
+    atualizarStatusGitHub();
+    alert(ok ? 'Conectado ao GitHub!' : `Não consegui conectar.\nMotivo: ${ultimoErroGH || 'desconhecido'}`);
+    if(ok) mostrarTela('lista');
+  }catch(e){
+    alert('Não consegui ler esse código de configuração.');
+  }
+}
+
 async function salvarConfigGithub(){
-  const ownerRepo = document.getElementById('gh-owner-repo').value.trim();
+  const ownerRepo = limparParaHeader(document.getElementById('gh-owner-repo').value);
   const [owner, repo] = ownerRepo.split('/').map(s => s && s.trim());
-  const path = document.getElementById('gh-caminho').value.trim() || 'musicas.json';
-  const branch = document.getElementById('gh-branch').value.trim() || 'main';
-  const token = document.getElementById('gh-token').value.trim();
+  const path = limparParaHeader(document.getElementById('gh-caminho').value) || 'musicas.json';
+  const branch = limparParaHeader(document.getElementById('gh-branch').value) || 'main';
+  const token = limparParaHeader(document.getElementById('gh-token').value);
 
   if(!owner || !repo || !token){
     alert('Preencha ao menos o repositório (usuario/repo) e o token.');
@@ -697,7 +786,7 @@ async function salvarConfigGithub(){
   const ok = await carregarDoGitHub();
   githubConectado = ok;
   atualizarStatusGitHub();
-  alert(ok ? 'Conectado ao GitHub!' : 'Não consegui conectar — confira o repositório, o caminho e o token.');
+  alert(ok ? 'Conectado ao GitHub!' : `Não consegui conectar.\nMotivo: ${ultimoErroGH || 'desconhecido'}`);
   if(ok) mostrarTela('lista');
 }
 
@@ -894,6 +983,7 @@ preencherFormConfigGH();
 (async () => {
   const ok = await carregarDoGitHub();
   githubConectado = ok;
+  if(!ok){ await carregarArquivoPublico(); }
   renderLista();
   atualizarStatusGitHub();
 })();
